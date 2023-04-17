@@ -3,7 +3,7 @@ RUN mkdir /src
 WORKDIR /src
 COPY *.go go.mod go.sum /src/
 RUN apk add git
-RUN go build .
+RUN CGO_ENABLED=0 go build .
 
 FROM gcr.io/distroless/static-debian11:nonroot
 COPY --from=build /src/exporter_exporter /usr/bin/
