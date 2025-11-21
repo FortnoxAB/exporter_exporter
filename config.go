@@ -10,7 +10,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 package main
 
 import (
@@ -18,20 +17,22 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
+	"os"
 	"sync"
 	"time"
 
-	yaml "gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v3"
 )
 
 type config struct {
-	Global    struct{}
-	Modules   map[string]*moduleConfig
-	Discovery *discoveryConfig
-	XXX       map[string]interface{} `yaml:",inline"`
+	Global struct {
+	}
+	Modules       map[string]*moduleConfig
+	DefaultModule string `yaml:"defaultModule"`
+	Discovery     *discoveryConfig
+	XXX           map[string]interface{} `yaml:",inline"`
 
 	bearerToken   string
 	proxyPath     string
@@ -83,6 +84,7 @@ type moduleConfig struct {
 
 	Exec execConfig `yaml:"exec"`
 	HTTP httpConfig `yaml:"http"`
+	File fileConfig `yaml:"file"`
 
 	name string
 }
@@ -105,6 +107,8 @@ type httpConfig struct {
 	TLSCertFile           *string                `yaml:"tls_cert_file"`            // no default
 	TLSKeyFile            *string                `yaml:"tls_key_file"`             // no default
 	TLSCACertFile         *string                `yaml:"tls_ca_cert_file"`         // no default
+	TLSRootCaFile         *string                `yaml:"tls_root_ca_file"`         // no default
+	TLSServerName         *string                `yaml:"server_name"`              // no default
 	Port                  int                    `yaml:"port"`                     // no default
 	Path                  string                 `yaml:"path"`                     // /metrics
 	Scheme                string                 `yaml:"scheme"`                   // http
@@ -128,6 +132,11 @@ type execConfig struct {
 	mcfg *moduleConfig
 }
 
+type fileConfig struct {
+	Path string `yaml:"path"`
+	mcfg *moduleConfig
+}
+
 func readConfig(r io.Reader) (*config, error) {
 	cfg := config{}
 	err := yaml.NewDecoder(r).Decode(&cfg)
@@ -140,8 +149,8 @@ func readConfig(r io.Reader) (*config, error) {
 	}
 
 	for s := range cfg.Modules {
-		if err = checkModuleConfig(s, cfg.Modules[s]); err != nil {
-			return nil, fmt.Errorf("bad config for module %s, %w", s, err)
+		if merr := checkModuleConfig(s, cfg.Modules[s]); merr != nil {
+			return nil, fmt.Errorf("bad config for module %s, %w", s, merr)
 		}
 	}
 
@@ -209,6 +218,10 @@ func checkModuleConfig(name string, cfg *moduleConfig) error {
 		if len(cfg.Exec.XXX) != 0 {
 			return fmt.Errorf("unknown exec module configuration fields: %v", cfg.Exec.XXX)
 		}
+	case "file":
+		if cfg.File.Path == "" {
+			return fmt.Errorf("path argument for file module is mandatory")
+		}
 	default:
 		return fmt.Errorf("unknown module method: %v", cfg.Method)
 	}
@@ -222,13 +235,31 @@ func (c httpConfig) getTLSConfig() (*tls.Config, error) {
 		MinVersion:         tls.VersionTLS12,
 	}
 	if c.TLSCACertFile != nil {
-		caCert, err := ioutil.ReadFile(*c.TLSCACertFile)
+		caCert, err := os.ReadFile(*c.TLSCACertFile)
 		if err != nil {
 			return nil, fmt.Errorf("could not read ca from %v, %w", *c.TLSCACertFile, err)
 		}
 
 		config.ClientCAs = x509.NewCertPool()
 		config.ClientCAs.AppendCertsFromPEM(caCert)
+	}
+	if c.TLSRootCaFile != nil {
+		caRootCert, err := os.ReadFile(*c.TLSRootCaFile)
+		if err != nil {
+			return nil, fmt.Errorf("could not read root ca from %v, %w", *c.TLSRootCaFile, err)
+		}
+
+		systemCAPool, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, fmt.Errorf("could not read system's root ca cert pool %w", err)
+		}
+		// if the cert could not be appended, it will still use the system's root ca pool
+		systemCAPool.AppendCertsFromPEM(caRootCert)
+
+		config.RootCAs = systemCAPool
+	}
+	if c.TLSServerName != nil {
+		config.ServerName = *c.TLSServerName
 	}
 	if c.TLSCertFile != nil && c.TLSKeyFile != nil {
 		cert, err := tls.LoadX509KeyPair(*c.TLSCertFile, *c.TLSKeyFile)

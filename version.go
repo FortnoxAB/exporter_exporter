@@ -8,12 +8,13 @@ import (
 )
 
 var (
-	Version   = "unset"
-	Revision  = "unset"
-	Branch    = "unset"
-	BuildUser = "unset"
-	BuildDate = "unset"
-	GoVersion = runtime.Version()
+	Version   = "unset" // Version is set at build time
+	Revision  = "unset" // Revision is set at build time
+	Branch    = "unset" // Branch is set at build time
+	BuildUser = "unset" // BuildUser is set at build time
+	BuildDate = "unset" // BuildDate is set at build time
+
+	goVersion = runtime.Version()
 )
 
 var buildInfo = prometheus.NewGaugeVec(
@@ -26,7 +27,7 @@ var buildInfo = prometheus.NewGaugeVec(
 
 func init() {
 	prometheus.MustRegister(buildInfo)
-	buildInfo.WithLabelValues(Version, Revision, Branch, GoVersion).Set(1)
+	buildInfo.WithLabelValues(Version, Revision, Branch, goVersion).Set(1)
 }
 
 func versionStr() string {

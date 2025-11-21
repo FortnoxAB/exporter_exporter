@@ -21,7 +21,8 @@ The exporter has three endpoints.
   - Returns JSON if the header "Accept: application/json" is passed
 
 - /proxy: which takes the following parameters:
-  - *module*: the name of the module from the configuration to execute.
+  - *module*: the name of the module from the configuration to execute. (a default
+    module can be selected using the defaultModule config option)
   - *args*: (only for exec modules): additional arguments to the backend command.
   - all other query string parameters are passed on to any http backend module.
     (excluding the first *module* parameter value).
@@ -57,6 +58,7 @@ and can only be changed by uninstalling/installing it again (or modifying the Wi
 In expexp.yaml list each exporter listening on localhost with its known port.
 
 ```
+defaultModule: node # called if "module" param is not supplied
 modules:
   node:
     method: http
@@ -86,7 +88,7 @@ modules:
     method: http
     http:
        port: 9115
-       path: '/proxy'
+       path: '/probe'
 
   somescript:
     method: exec
@@ -99,6 +101,11 @@ modules:
       env:
         THING: "1"
         THING2: "2"
+
+  somefile:
+    method: file
+    file:
+      path: /tmp/myfile.prometheus.txt
 ```
 
 In your prometheus configuration
@@ -171,6 +178,10 @@ files.  The module name is taken from the name of the file (minus the
 yml/yaml extension), and the configuration for that module goes in at the
 top level.
 
+Note that if you want to use *only* this configuration method and not the file-based 
+configuration (`-config.file` option), you must provide an empty string for the file
+option : `./exporter_exporter -config.file "" -config.dirs "/etc/exporter_exporter/"`
+
 ```
 ==> expexp.yaml <==
 modules: {}
@@ -201,8 +212,8 @@ prometheus server and one key/cert shared between all the remote nodes.
 Firstly, create the keys and certs:
 
 ```
-openssl req -x509 -newkey rsa:1024 -keyout prom_node_key.pem -out prom_node_cert.pem -days 29220 -nodes -subj /commonName=prom_node/ -addext "subjectAltName=DNS:prom_node"
-openssl req -x509 -newkey rsa:1024 -keyout prometheus_key.pem -out prometheus_cert.pem -days 29220 -nodes -subj /commonName=prometheus/ -addext "subjectAltName=DNS:prometheus"
+openssl req -x509 -newkey rsa:2048 -keyout prom_node_key.pem -out prom_node_cert.pem -days 29220 -nodes -subj /commonName=prom_node/ -addext "subjectAltName=DNS:prom_node"
+openssl req -x509 -newkey rsa:2048 -keyout prometheus_key.pem -out prometheus_cert.pem -days 29220 -nodes -subj /commonName=prometheus/ -addext "subjectAltName=DNS:prometheus"
 ```
 
 Create an `/etc/prometheus/ssl/` directory on the prometheus server and all

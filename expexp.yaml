@@ -1,5 +1,5 @@
-discovery: 
+discovery:
   enabled: true
-  exporters: 
+  exporters:
     node:
       port: 9100

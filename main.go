@@ -22,7 +22,6 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -65,7 +64,7 @@ var (
 	pPath = flag.String("web.proxy-path", "/proxy", "The address to listen on for HTTP requests.")
 
 	logLevel = LogLevelFlag(log.WarnLevel)
-	logJson  = flag.Bool("log.json", false, "Serialize log messages in JSON")
+	logJSON  = flag.Bool("log.json", false, "Serialize log messages in JSON")
 
 	proxyDuration = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
@@ -126,13 +125,13 @@ func setup() (*config, error) {
 		if err != nil {
 			return nil, err
 		}
-		for mn := range cfg.GetModules() {
+		for mn := range cfg.Modules {
 			log.Debugf("read module config '%s' from: %s", mn, *cfgFile)
 		}
 	}
 
 	for _, cfgDir := range cfgDirs {
-		mfs, err := ioutil.ReadDir(cfgDir)
+		mfs, err := os.ReadDir(cfgDir)
 		if err != nil {
 			if *skipDirs && os.IsNotExist(err) {
 				log.Warnf("skipping non existent config.dirs entry '%s'", cfgDir)
@@ -190,7 +189,7 @@ func setup() (*config, error) {
 		if *bearerToken != "" {
 			return nil, errors.New(("web.bearer.token and web.bearer.token-file are mutually exclusive options"))
 		}
-		bs, err := ioutil.ReadFile(*bearerTokenFile)
+		bs, err := os.ReadFile(*bearerTokenFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed reading bearer file %s, %w", *bearerTokenFile, err)
 		}
@@ -221,7 +220,7 @@ func setup() (*config, error) {
 }
 
 func getClientValidator(r *regexp.Regexp, helloInfo *tls.ClientHelloInfo) func([][]byte, [][]*x509.Certificate) error {
-	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+	return func(_ [][]byte, verifiedChains [][]*x509.Certificate) error {
 		for _, c := range verifiedChains {
 			leaf := c[0]
 
@@ -272,7 +271,7 @@ func setupTLS() (*tls.Config, error) {
 
 	if !*verify {
 		pool := x509.NewCertPool()
-		cabs, err := ioutil.ReadFile(*caPath)
+		cabs, err := os.ReadFile(*caPath)
 		if err != nil {
 			return nil, fmt.Errorf("could not open ca file, %w", err)
 		}
@@ -381,7 +380,7 @@ func main() {
 	}
 
 	log.SetLevel(log.Level(logLevel))
-	if *logJson {
+	if *logJSON {
 		log.SetFormatter(&log.JSONFormatter{})
 	}
 	handler = &AccessLogMiddleware{handler}
@@ -417,6 +416,7 @@ func (w *responseWriterWithStatus) WriteHeader(status int) {
 	w.ResponseWriter.WriteHeader(status)
 }
 
+// AccessLogMiddleware logs all request at Info level
 type AccessLogMiddleware struct {
 	http.Handler
 }
@@ -439,22 +439,30 @@ func (middleware AccessLogMiddleware) ServeHTTP(w http.ResponseWriter, r *http.R
 
 func (cfg *config) doProxy(w http.ResponseWriter, r *http.Request) {
 	mod, ok := r.URL.Query()["module"]
-	if !ok {
+	if !ok && cfg.DefaultModule == "" {
 		log.Errorf("no module given")
 		http.Error(w, fmt.Sprintf("require parameter module is missing%v\n", mod), http.StatusBadRequest)
 		return
 	}
 
+	if len(mod) == 0 {
+		mod = append(mod, cfg.DefaultModule)
+	}
+
 	log.Debugf("running module %v\n", mod[0])
 
-	if m := cfg.getModule(mod[0]); m != nil {
-		m.ServeHTTP(w, r)
+	var h http.Handler
+	m, ok := cfg.Modules[mod[0]]
+	if !ok {
+		proxyErrorCount.WithLabelValues("unknown").Inc()
+		log.Warnf("unknown module requested  %v\n", mod)
+		http.Error(w, fmt.Sprintf("unknown module %v\n", mod), http.StatusNotFound)
 		return
 	}
 
-	proxyErrorCount.WithLabelValues("unknown").Inc()
-	log.Warnf("unknown module requested  %v\n", mod)
-	http.Error(w, fmt.Sprintf("unknown module %v\n", mod), http.StatusNotFound)
+	h = m
+
+	h.ServeHTTP(w, r)
 }
 
 func (cfg *config) listModules(w http.ResponseWriter, r *http.Request) {
@@ -508,6 +516,9 @@ func (m moduleConfig) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "http":
 		m.HTTP.mcfg = &m
 		m.HTTP.ServeHTTP(w, nr)
+	case "file":
+		m.File.mcfg = &m
+		m.File.ServeHTTP(w, nr)
 	default:
 		log.Errorf("unknown module method  %v\n", m.Method)
 		proxyErrorCount.WithLabelValues(m.name).Inc()
@@ -516,7 +527,7 @@ func (m moduleConfig) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// StringSliceFlags collects multiple uses of a named flag into a slice.
+// StringSliceFlag collects multiple uses of a named flag into a slice.
 type StringSliceFlag []string
 
 func (s *StringSliceFlag) String() string {
@@ -525,6 +536,7 @@ func (s *StringSliceFlag) String() string {
 	return strings.Join(*s, ", ")
 }
 
+// Set fullfills the flag.Value interface
 func (s *StringSliceFlag) Set(value string) error {
 	*s = append(*s, value)
 	return nil
@@ -542,26 +554,33 @@ func (nets IPNetSliceFlag) String() string {
 	return strings.Join(netsStr, ", ")
 }
 
+// Set fullfills the flag.Value interface
 func (nets *IPNetSliceFlag) Set(value string) error {
-	if _, net, err := net.ParseCIDR(value); err != nil {
+	_, net, err := net.ParseCIDR(value)
+	if err != nil {
 		return err
-	} else {
-		*nets = append(*nets, *net)
 	}
+
+	*nets = append(*nets, *net)
+
 	return nil
 }
 
+// LogLevelFlag implements a flag.Value that sets the logging level
 type LogLevelFlag log.Level
 
 func (level LogLevelFlag) String() string {
 	return log.Level(level).String()
 }
 
+// Set fullfills the flag.Value interface
 func (level *LogLevelFlag) Set(value string) error {
-	if lvl, err := log.ParseLevel(value); err != nil {
+	lvl, err := log.ParseLevel(value)
+	if err != nil {
 		return err
-	} else {
-		*level = LogLevelFlag(lvl)
 	}
+
+	*level = LogLevelFlag(lvl)
+
 	return nil
 }

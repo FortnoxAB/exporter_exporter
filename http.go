@@ -14,25 +14,39 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	// Msg to send in response body when verification of proxied server
-	// response is failed.
+	// VerificationErrorMsg to send in response body when verification of proxied server
+	// response is failed
 	VerificationErrorMsg = "Internal Server Error: " +
 		"Response from proxied server failed verification. " +
 		"See server logs for details"
 )
+
+// VerifyError is an error type that supports reporting verification errors
+type VerifyError struct {
+	msg   string
+	cause error
+}
+
+func (e *VerifyError) Error() string { return e.msg + ": " + e.cause.Error() }
+func (e *VerifyError) Unwrap() error { return e.cause }
 
 func (cfg moduleConfig) getReverseProxyDirectorFunc() (func(*http.Request), error) {
 	base, err := url.Parse(cfg.HTTP.Path)
@@ -59,6 +73,9 @@ func (cfg moduleConfig) getReverseProxyDirectorFunc() (func(*http.Request), erro
 
 		r.URL.Scheme = cfg.HTTP.Scheme
 		r.URL.Host = net.JoinHostPort(cfg.HTTP.Address, strconv.Itoa(cfg.HTTP.Port))
+		if _, ok := cfg.HTTP.Headers["host"]; ok {
+			r.Host = cfg.HTTP.Headers["host"]
+		}
 		r.URL.Path = base.Path
 		if cfg.HTTP.BasicAuthUsername != "" && cfg.HTTP.BasicAuthPassword != "" {
 			r.SetBasicAuth(cfg.HTTP.BasicAuthUsername, cfg.HTTP.BasicAuthPassword)
@@ -66,8 +83,62 @@ func (cfg moduleConfig) getReverseProxyDirectorFunc() (func(*http.Request), erro
 	}, nil
 }
 
+func (cfg moduleConfig) getReverseProxyModifyResponseFunc() func(*http.Response) error {
+	return func(resp *http.Response) error {
+		if resp.StatusCode != 200 {
+			return nil
+		}
+
+		var (
+			err     error
+			body    bytes.Buffer
+			oldBody = resp.Body
+		)
+		defer oldBody.Close()
+
+		if _, err = body.ReadFrom(oldBody); err != nil {
+			return &VerifyError{"Failed to read body from proxied server", err}
+		}
+
+		resp.Body = io.NopCloser(bytes.NewReader(body.Bytes()))
+
+		var bodyReader io.ReadCloser
+		if resp.Header.Get("Content-Encoding") == "gzip" {
+			bodyReader, err = gzip.NewReader(bytes.NewReader(body.Bytes()))
+			if err != nil {
+				return &VerifyError{"Failed to decode gzipped response", err}
+			}
+		} else {
+			bodyReader = io.NopCloser(bytes.NewReader(body.Bytes()))
+		}
+		defer bodyReader.Close()
+
+		dec := expfmt.NewDecoder(bodyReader, expfmt.ResponseFormat(resp.Header))
+		for {
+			mf := dto.MetricFamily{}
+			err := dec.Decode(&mf)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				proxyMalformedCount.WithLabelValues(cfg.name).Inc()
+				return &VerifyError{"Failed to decode metrics from proxied server", err}
+			}
+		}
+
+		return nil
+	}
+}
+
 func (cfg moduleConfig) getReverseProxyErrorHandlerFunc() func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, _ *http.Request, err error) {
+		var verifyError *VerifyError
+		if errors.As(err, &verifyError) {
+			log.Errorf("Verification for module '%s' failed: %v", cfg.name, err)
+			http.Error(w, VerificationErrorMsg, http.StatusInternalServerError)
+			return
+		}
+
 		if errors.Is(err, context.DeadlineExceeded) {
 			log.Errorf("Request time out for module '%s'", cfg.name)
 			http.Error(w, http.StatusText(http.StatusGatewayTimeout), http.StatusGatewayTimeout)
@@ -79,7 +150,8 @@ func (cfg moduleConfig) getReverseProxyErrorHandlerFunc() func(http.ResponseWrit
 	}
 }
 
-// BearerAuthMiddleware.
+// BearerAuthMiddleware checks an Authorization: Berarer header for a known
+// token
 type BearerAuthMiddleware struct {
 	http.Handler
 	Token string
@@ -106,6 +178,8 @@ func (b BearerAuthMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	b.Handler.ServeHTTP(w, r)
 }
 
+// IPAddressAuthMiddleware matches all incoming requests to a known
+// set of remote net.IPNet networks
 type IPAddressAuthMiddleware struct {
 	http.Handler
 	ACL []net.IPNet
