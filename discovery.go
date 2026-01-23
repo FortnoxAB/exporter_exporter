@@ -111,7 +111,11 @@ func runDiscovery(ctx context.Context, cfg *config) {
 				continue
 			}
 			mc.HTTP.Scheme = u.Scheme
-			mc.HTTP.Path = u.Path
+			if u.RawQuery != "" {
+				mc.HTTP.Path = fmt.Sprintf("%s?%s", u.Path, u.RawQuery)
+			} else {
+				mc.HTTP.Path = u.Path
+			}
 		}
 
 		err := checkModuleConfig(name, mc)
